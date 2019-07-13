@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/DE-labtory/iLogger"
 	"sync"
+	"sync/atomic"
 
 	"github.com/DE-labtory/cleisthenes"
 	"github.com/DE-labtory/cleisthenes/pb"
@@ -71,6 +73,7 @@ type RBC struct {
 	// number of byzantine nodes which can tolerate
 	f int
 
+	epoch cleisthenes.Epoch
 	// owner of rbc instance (node)
 	owner cleisthenes.Member
 
@@ -96,6 +99,7 @@ type RBC struct {
 
 	valReceived, echoSent, readySent, done *cleisthenes.BinaryState
 
+	stopFlag int32
 	// internal channels to communicate with other components
 	closeChan chan struct{}
 	reqChan   chan request
@@ -106,6 +110,7 @@ type RBC struct {
 
 func New(
 	n, f int,
+	epoch cleisthenes.Epoch,
 	owner, proposer cleisthenes.Member,
 	broadcaster cleisthenes.Broadcaster,
 	dataSender cleisthenes.DataSender,
@@ -123,6 +128,7 @@ func New(
 	rbc := &RBC{
 		n:               n,
 		f:               f,
+		epoch:epoch,
 		owner:           owner,
 		proposer:        proposer,
 		enc:             enc,
@@ -137,7 +143,7 @@ func New(
 		readySent:       cleisthenes.NewBinaryState(),
 		done:            cleisthenes.NewBinaryState(),
 		closeChan:       make(chan struct{}),
-		reqChan:         make(chan request),
+		reqChan:         make(chan request, n*n),
 		broadcaster:     broadcaster,
 		dataSender:      dataSender,
 	}
@@ -165,6 +171,7 @@ func (rbc *RBC) distributeMessage(proposer cleisthenes.Member, reqs []cleisthene
 			Proposer:  proposer.Address.String(),
 			Sender:    rbc.owner.Address.String(),
 			Timestamp: ptypes.TimestampNow(),
+			Epoch: uint64(rbc.epoch),
 			Payload: &pb.Message_Rbc{
 				Rbc: &pb.RBC{
 					Payload:       payload,
@@ -197,6 +204,7 @@ func (rbc *RBC) shareMessage(proposer cleisthenes.Member, req cleisthenes.Reques
 		Proposer:  proposer.Address.String(),
 		Sender:    rbc.owner.Address.String(),
 		Timestamp: ptypes.TimestampNow(),
+		Epoch: uint64(rbc.epoch),
 		Payload: &pb.Message_Rbc{
 			Rbc: &pb.RBC{
 				Payload:       payload,
@@ -326,7 +334,7 @@ func (rbc *RBC) handleEchoRequest(sender cleisthenes.Member, req *EchoRequest) e
 		rbc.decodeSuccess(value)
 	}
 
-	fmt.Printf("[Echo Req] owner : %s, sender : %s\n", rbc.owner.Address.String(), sender.Address.String())
+	//fmt.Printf("[Echo Req] owner : %s, sender : %s\n", rbc.owner.Address.String(), sender.Address.String())
 	return nil
 }
 
@@ -352,15 +360,19 @@ func (rbc *RBC) handleReadyRequest(sender cleisthenes.Member, req *ReadyRequest)
 		rbc.decodeSuccess(value)
 	}
 
-	fmt.Printf("[Ready Req] owner : %s, sender : %s\n", rbc.owner.Address.String(), sender.Address.String())
+	//fmt.Printf("[Ready Req] owner : %s, sender : %s\n", rbc.owner.Address.String(), sender.Address.String())
 	return nil
 }
 
+func (rbc *RBC) toDie() bool {
+	return atomic.LoadInt32(&(rbc.stopFlag)) == int32(1)
+}
+
 func (rbc *RBC) run() {
-	for {
+	for !rbc.toDie() {
 		select {
-		case stop := <-rbc.closeChan:
-			rbc.closeChan <- stop
+		case <-rbc.closeChan:
+			rbc.closeChan <- struct{}{}
 			return
 		case req := <-rbc.reqChan:
 			req.err <- rbc.muxRequest(req.sender, req.data)
@@ -371,6 +383,10 @@ func (rbc *RBC) run() {
 func (rbc *RBC) Close() {
 	rbc.closeChan <- struct{}{}
 	<-rbc.closeChan
+	if first := atomic.CompareAndSwapInt32(&rbc.stopFlag, int32(0), int32(1)); !first {
+		return
+	}
+	//close(rbc.closeChan)
 }
 
 func (rbc *RBC) countEchos(rootHash []byte) int {
@@ -439,6 +455,7 @@ func (rbc *RBC) decodeSuccess(decValue []byte) {
 		Data:   rbc.output.value(),
 	})
 	rbc.output.delete()
+	iLogger.Debugf(nil,"[RBC success] epoch : %d, owner : %s, proposer : %s\n", rbc.epoch, rbc.owner.Address.String(), rbc.proposer.Address.String())
 }
 
 // wait until receive N - f ECHO messages

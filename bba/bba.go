@@ -3,6 +3,7 @@ package bba
 import (
 	"encoding/json"
 	"errors"
+	"github.com/DE-labtory/iLogger"
 	"reflect"
 	"strconv"
 	"sync"
@@ -59,6 +60,8 @@ type BBA struct {
 	// number of byzantine nodes which can tolerate
 	f int
 
+	epoch cleisthenes.Epoch
+
 	stopFlag int32
 	// done is flag whether BBA is terminated or not
 	done *cleisthenes.BinaryState
@@ -88,8 +91,8 @@ type BBA struct {
 }
 
 func New(
-	n int,
-	f int,
+	n, f int,
+	epoch cleisthenes.Epoch,
 	owner cleisthenes.Member,
 	proposer cleisthenes.Member,
 	broadcaster cleisthenes.Broadcaster,
@@ -100,6 +103,7 @@ func New(
 		proposer: proposer,
 		n:        n,
 		f:        f,
+		epoch:epoch,
 		round:    newRound(),
 
 		binValueSet:        newBinarySet(),
@@ -184,12 +188,12 @@ func (bba *BBA) Idle() bool {
 }
 
 func (bba *BBA) Close() {
+	bba.closeChan <- struct{}{}
+	<-bba.closeChan
 	if first := atomic.CompareAndSwapInt32(&bba.stopFlag, int32(0), int32(1)); !first {
 		return
 	}
-	bba.closeChan <- struct{}{}
-	<-bba.closeChan
-	close(bba.reqChan)
+	//close(bba.closeChan)
 }
 
 func (bba *BBA) Trace() {
@@ -237,6 +241,7 @@ func (bba *BBA) handleBvalRequest(sender cleisthenes.Member, bval *BvalRequest) 
 	}
 
 	count := bba.countBvalByValue(bval.Value)
+	iLogger.Debugf(nil,"bba bval epoch : %d, onwer : %s, proposer : %s\n", bba.epoch, bba.owner.Address.String(), bba.proposer.Address.String())
 	bba.Log("action", "handleBval", "from", sender.Address.String(), "count", strconv.Itoa(count))
 	if count == bba.binValueSetThreshold() {
 		bba.Log("action", "binValueSet", "count", strconv.Itoa(count))
@@ -257,6 +262,7 @@ func (bba *BBA) handleAuxRequest(sender cleisthenes.Member, aux *AuxRequest) err
 		return err
 	}
 	count := bba.countAuxByValue(aux.Value)
+	iLogger.Debugf(nil,"bba aux epoch : %d, onwer : %s, proposer : %s\n", bba.epoch, bba.owner.Address.String(), bba.proposer.Address.String())
 	bba.Log("action", "handleAux", "from", sender.Address.String(), "count", strconv.Itoa(count))
 	if count < bba.tryoutAgreementThreshold() {
 		return nil
@@ -310,6 +316,7 @@ func (bba *BBA) agreementSuccess(decValue cleisthenes.Binary) {
 		"message", "<agreement finish>",
 		"my.round", strconv.FormatUint(bba.round.value(), 10),
 	)
+	iLogger.Debugf(nil,"[BBA success] epoch : %d, owner : %s, proposer : %s\n", bba.epoch, bba.owner.Address.String(), bba.proposer.Address.String())
 	bba.advanceRoundChan <- bba.round.value()
 }
 
@@ -323,6 +330,7 @@ func (bba *BBA) advanceRound() {
 	bba.auxBroadcasted = cleisthenes.NewBinaryState()
 
 	bba.round.inc()
+	iLogger.Debugf(nil,"[BBA advance] epoch : %d, round : %d, owner : %s, proposer : %s\n", bba.epoch, bba.round.value(), bba.owner.Address.String(), bba.proposer.Address.String())
 
 	bba.handleDelayedBvalRequest()
 
@@ -421,6 +429,7 @@ func (bba *BBA) broadcast(req cleisthenes.Request) error {
 		Proposer:  bba.proposer.Address.String(),
 		Sender:    bba.owner.Address.String(),
 		Timestamp: ptypes.TimestampNow(),
+		Epoch: uint64(bba.epoch),
 		Payload:   bbaMsg,
 	}
 
@@ -438,6 +447,7 @@ func (bba *BBA) run() {
 		select {
 		case <-bba.closeChan:
 			bba.closeChan <- struct{}{}
+			return
 		case req := <-bba.reqChan:
 			bba.muxMessage(req.sender, req.round, req.data)
 		case r := <-bba.binValueChan:
